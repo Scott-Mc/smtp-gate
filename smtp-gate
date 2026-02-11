@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+# smtp-gate -- block outbound SMTP from VM guests at the hypervisor
+set -euo pipefail
+
+CONF_DIR="/etc/smtp-gate"
+CONF_FILE="$CONF_DIR/config"
+WL_FILE="$CONF_DIR/whitelist.csv"
+
+TABLE="smtp_gate"
+CHAIN="fwd"
+SET_WL="wl_macs"
+SET_PORTS="blocked_ports"
+SET_VMPORTS="vm_ports"
+SET_UPLINKS="uplinks"
+
+require_root() { [[ "${EUID}" -eq 0 ]] || { echo "error: run as root" >&2; exit 1; }; }
+have_cmd()     { command -v "$1" >/dev/null 2>&1; }
+
+load_conf() {
+  BRIDGE="br0"
+  BLOCKED_PORTS="25,465"
+  LOG_DROPS="1"
+  LOG_RATE="5/second"
+  LOG_BURST="50"
+  [[ -f "$CONF_FILE" ]] && source "$CONF_FILE"
+}
+
+ensure_dirs() {
+  mkdir -p "$CONF_DIR"
+  [[ -f "$WL_FILE" ]] || printf "# vmname,mac,added_at,added_by,reason\n" > "$WL_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Bridge / port discovery
+# ---------------------------------------------------------------------------
+
+bridge_ports() {
+  bridge link | awk -v br="$BRIDGE" '$0 ~ ("master " br) {print $2}' | sed 's/://'
+}
+
+uplink_ports() {
+  local re="${UPLINK_REGEX:-^(ens|eno|enp|eth|bond)[0-9a-zA-Z_.:-]*$}"
+  bridge_ports | awk -v re="$re" '$0 ~ re'
+}
+
+vm_ports() {
+  local upl
+  upl="$(uplink_ports | tr '\n' ' ' | xargs || true)"
+  bridge_ports | while read -r p; do
+    [[ -n "$p" ]] || continue
+    [[ "$p" == "$BRIDGE" ]] && continue
+    echo " $upl " | grep -q " $p " && continue
+    echo "$p"
+  done
+}
+
+parse_ports() { echo "$BLOCKED_PORTS" | tr ',' ' ' | xargs -n1; }
+
+vm_macs() {
+  local vm="$1"
+  virsh domiflist "$vm" 2>/dev/null \
+    | awk 'BEGIN{IGNORECASE=1} $0 ~ /bridge/ && $5 ~ /([0-9a-f]{2}:){5}[0-9a-f]{2}/ {print tolower($5)}'
+}
+
+# ---------------------------------------------------------------------------
+# Preflight checks
+# ---------------------------------------------------------------------------
+
+preflight() {
+  have_cmd nft    || { echo "error: nft not found" >&2; exit 1; }
+  have_cmd bridge || { echo "error: bridge (iproute2) not found" >&2; exit 1; }
+  have_cmd ip     || { echo "error: ip not found" >&2; exit 1; }
+
+  ip link show "$BRIDGE" >/dev/null 2>&1 \
+    || { echo "error: bridge '$BRIDGE' not found" >&2; exit 1; }
+
+  local upl vm
+  upl="$(uplink_ports || true)"
+  [[ -n "$upl" ]] \
+    || { echo "error: no uplink ports on '$BRIDGE' (set UPLINK_REGEX in config)" >&2; exit 1; }
+
+  vm="$(vm_ports || true)"
+  [[ -n "$vm" ]] \
+    || echo "warn: no VM ports on '$BRIDGE'; applying empty ruleset" >&2
+}
+
+# ---------------------------------------------------------------------------
+# nftables ruleset generation
+# ---------------------------------------------------------------------------
+
+generate_ruleset() {
+  local tmp="$1"
+  local upl vm
+
+  upl="$(uplink_ports)"
+  vm="$(vm_ports || true)"
+
+  # The ensure-exists / delete / recreate pattern makes the entire load
+  # atomic: nft -f applies the file as a single transaction so there is
+  # never a window where the table is absent.
+  {
+    echo "table bridge $TABLE { }"
+    echo "delete table bridge $TABLE"
+    echo "table bridge $TABLE {"
+    echo "  set $SET_WL       { type ether_addr;   }"
+    echo "  set $SET_PORTS    { type inet_service;  }"
+    echo "  set $SET_VMPORTS  { type ifname;        }"
+    echo "  set $SET_UPLINKS  { type ifname;        }"
+    echo "  chain $CHAIN {"
+    echo "    type filter hook forward priority -200; policy accept;"
+
+    # Whitelisted MACs bypass the block (IPv4 + IPv6)
+    echo "    iifname @$SET_VMPORTS oifname @$SET_UPLINKS ether type ip  ether saddr @$SET_WL tcp dport @$SET_PORTS accept"
+    echo "    iifname @$SET_VMPORTS oifname @$SET_UPLINKS ether type ip6 ether saddr @$SET_WL tcp dport @$SET_PORTS accept"
+
+    # Log and drop must be separate rules.  nftables "limit" is a match
+    # expression: packets exceeding the rate skip the rule entirely.  If
+    # log+drop were combined in one limited rule, excess packets would
+    # fall through to the chain policy (accept).
+    if [[ "${LOG_DROPS}" == "1" ]]; then
+      echo "    iifname @$SET_VMPORTS oifname @$SET_UPLINKS ether type ip  tcp dport @$SET_PORTS limit rate ${LOG_RATE} burst ${LOG_BURST} log prefix \"SMTPGATE4 \" flags all"
+      echo "    iifname @$SET_VMPORTS oifname @$SET_UPLINKS ether type ip6 tcp dport @$SET_PORTS limit rate ${LOG_RATE} burst ${LOG_BURST} log prefix \"SMTPGATE6 \" flags all"
+    fi
+    echo "    iifname @$SET_VMPORTS oifname @$SET_UPLINKS ether type ip  tcp dport @$SET_PORTS counter drop"
+    echo "    iifname @$SET_VMPORTS oifname @$SET_UPLINKS ether type ip6 tcp dport @$SET_PORTS counter drop"
+
+    echo "  }"
+    echo "}"
+  } > "$tmp"
+
+  # Populate sets
+  {
+    echo "flush set bridge $TABLE $SET_PORTS"
+    while read -r p; do
+      [[ -n "$p" ]] || continue
+      echo "add element bridge $TABLE $SET_PORTS { $p }"
+    done < <(parse_ports)
+
+    echo "flush set bridge $TABLE $SET_UPLINKS"
+    while read -r p; do
+      [[ -n "$p" ]] || continue
+      echo "add element bridge $TABLE $SET_UPLINKS { \"$p\" }"
+    done <<< "$upl"
+
+    echo "flush set bridge $TABLE $SET_VMPORTS"
+    while read -r p; do
+      [[ -n "$p" ]] || continue
+      echo "add element bridge $TABLE $SET_VMPORTS { \"$p\" }"
+    done <<< "$vm"
+
+    echo "flush set bridge $TABLE $SET_WL"
+    awk -F',' '
+      BEGIN{IGNORECASE=1}
+      $1 ~ /^#/ {next}
+      NF >= 2 {
+        gsub(/^[ \t]+|[ \t]+$/, "", $2);
+        if ($2 ~ /^([0-9a-f]{2}:){5}[0-9a-f]{2}$/) print tolower($2);
+      }' "$WL_FILE" | while read -r mac; do
+        [[ -n "$mac" ]] || continue
+        echo "add element bridge $TABLE $SET_WL { $mac }"
+      done
+  } >> "$tmp"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_apply() {
+  load_conf
+  ensure_dirs
+  preflight
+
+  local tmp
+  tmp="$(mktemp /tmp/smtp-gate.XXXXXX.nft)"
+  trap 'rm -f "$tmp"' EXIT
+
+  generate_ruleset "$tmp"
+
+  nft -c -f "$tmp"   # validate (dry-run); on failure nothing changes
+  nft -f "$tmp"       # atomic load
+
+  echo "ok: applied bridge=$BRIDGE ports=$BLOCKED_PORTS"
+}
+
+cmd_status() {
+  load_conf
+  ensure_dirs
+  echo "Config:"
+  echo "  BRIDGE=$BRIDGE"
+  echo "  BLOCKED_PORTS=$BLOCKED_PORTS"
+  echo "  LOG_DROPS=$LOG_DROPS"
+  echo "  UPLINK_REGEX=${UPLINK_REGEX:-<default>}"
+  echo
+  echo "Bridge ports ($BRIDGE):"
+  bridge_ports | sed 's/^/  - /'
+  echo
+  echo "Uplinks:"
+  uplink_ports | sed 's/^/  - /'
+  echo
+  echo "VM ports:"
+  vm_ports | sed 's/^/  - /'
+  echo
+  echo "nft table:"
+  nft list table bridge "$TABLE" 2>/dev/null || echo "  (not loaded)"
+}
+
+cmd_rollback() {
+  nft delete table bridge "$TABLE" >/dev/null 2>&1 || true
+  echo "ok: removed table bridge $TABLE"
+}
+
+cmd_ports_set() {
+  local ports="${1:-}"
+  [[ -n "$ports" ]] || { echo "error: provide ports like '25,465,587'" >&2; exit 1; }
+  mkdir -p "$CONF_DIR"
+  if [[ -f "$CONF_FILE" ]] && grep -q '^BLOCKED_PORTS=' "$CONF_FILE"; then
+    sed -i "s/^BLOCKED_PORTS=.*/BLOCKED_PORTS=\"${ports}\"/" "$CONF_FILE"
+  else
+    echo "BLOCKED_PORTS=\"${ports}\"" >> "$CONF_FILE"
+  fi
+  echo "ok: set BLOCKED_PORTS=$ports (run apply to activate)"
+}
+
+cmd_add_vm() {
+  load_conf
+  ensure_dirs
+  have_cmd virsh || { echo "error: virsh not found" >&2; exit 1; }
+
+  local vm="${1:-}"
+  local reason="${2:-manual}"
+  [[ -n "$vm" ]] || { echo "error: vm name required" >&2; exit 1; }
+
+  local macs now user
+  macs="$(vm_macs "$vm" || true)"
+  [[ -n "$macs" ]] || { echo "error: no bridged MACs found for vm '$vm'" >&2; exit 1; }
+
+  now="$(date -Is)"
+  user="${SUDO_USER:-root}"
+
+  while read -r mac; do
+    [[ -n "$mac" ]] || continue
+    echo "${vm},${mac},${now},${user},${reason}" >> "$WL_FILE"
+    echo "ok: whitelisted $vm ($mac)"
+  done <<< "$macs"
+
+  cmd_apply >/dev/null
+  echo "ok: applied"
+}
+
+cmd_add_mac() {
+  load_conf
+  ensure_dirs
+
+  local mac="${1:-}"
+  local label="${2:-manual}"
+  [[ -n "$mac" ]] || { echo "error: mac required" >&2; exit 1; }
+  [[ "$mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]] \
+    || { echo "error: invalid mac format" >&2; exit 1; }
+
+  local now user
+  now="$(date -Is)"
+  user="${SUDO_USER:-root}"
+  echo "${label},$(echo "$mac" | tr 'A-F' 'a-f'),${now},${user},manual-mac" >> "$WL_FILE"
+  echo "ok: whitelisted mac $mac (label=$label)"
+
+  cmd_apply >/dev/null
+  echo "ok: applied"
+}
+
+cmd_del_vm() {
+  load_conf
+  ensure_dirs
+
+  local vm="${1:-}"
+  [[ -n "$vm" ]] || { echo "error: vm name required" >&2; exit 1; }
+
+  local tmp
+  tmp="$(mktemp)"
+  awk -F',' -v vm="$vm" '
+    BEGIN{IGNORECASE=1}
+    $1 ~ /^#/ {print; next}
+    {gsub(/^[ \t]+|[ \t]+$/, "", $1); if ($1!=vm) print}
+  ' "$WL_FILE" > "$tmp"
+  mv "$tmp" "$WL_FILE"
+  echo "ok: removed whitelist entries for vm $vm"
+
+  cmd_apply >/dev/null
+  echo "ok: applied"
+}
+
+cmd_del_mac() {
+  load_conf
+  ensure_dirs
+
+  local mac="${1:-}"
+  [[ -n "$mac" ]] || { echo "error: mac required" >&2; exit 1; }
+  mac="$(echo "$mac" | tr 'A-F' 'a-f')"
+
+  local tmp
+  tmp="$(mktemp)"
+  awk -F',' -v mac="$mac" '
+    $1 ~ /^#/ {print; next}
+    {gsub(/^[ \t]+|[ \t]+$/, "", $2); if (tolower($2)!=mac) print}
+  ' "$WL_FILE" > "$tmp"
+  mv "$tmp" "$WL_FILE"
+  echo "ok: removed whitelist entries for mac $mac"
+
+  cmd_apply >/dev/null
+  echo "ok: applied"
+}
+
+cmd_list() {
+  ensure_dirs
+  if have_cmd column; then
+    column -s, -t "$WL_FILE"
+  else
+    cat "$WL_FILE"
+  fi
+}
+
+usage() {
+  cat <<EOF
+Usage: smtp-gate <command> [args]
+
+Commands:
+  apply                              Detect ports and (re)apply nftables rules
+  status                             Show config, detected ports, and active rules
+  rollback                           Remove nftables table (unblock all SMTP)
+  ports-set "25,465,587"             Update blocked ports in config
+  add-vm  <vmname> [reason]          Whitelist a VM by name (resolves MAC via virsh)
+  del-vm  <vmname>                   Remove a VM from the whitelist
+  add-mac <aa:bb:cc:dd:ee:ff> [label] Whitelist a MAC address directly
+  del-mac <aa:bb:cc:dd:ee:ff>        Remove a MAC from the whitelist
+  list                               Show whitelist entries
+
+Blocks outbound TCP to BLOCKED_PORTS from VM tap ports to uplink ports only.
+Inbound SMTP is never affected.  A systemd timer runs 'apply' periodically
+to pick up new/removed VMs automatically.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+require_root
+cmd="${1:-}"; shift || true
+
+case "$cmd" in
+  apply)     cmd_apply ;;
+  status)    cmd_status ;;
+  rollback)  cmd_rollback ;;
+  ports-set) cmd_ports_set "${1:-}" ;;
+  add-vm)    cmd_add_vm "${1:-}" "${2:-manual}" ;;
+  del-vm)    cmd_del_vm "${1:-}" ;;
+  add-mac)   cmd_add_mac "${1:-}" "${2:-manual}" ;;
+  del-mac)   cmd_del_mac "${1:-}" ;;
+  list)      cmd_list ;;
+  *)         usage; exit 1 ;;
+esac

@@ -1,0 +1,11 @@
+[Unit]
+Description=SMTP gate (bridge nftables)
+After=network-online.target libvirtd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/smtp-gate/smtp-gate apply
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
