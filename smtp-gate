@@ -7,7 +7,7 @@ CONF_FILE="$CONF_DIR/config"
 WL_FILE="$CONF_DIR/whitelist.csv"
 
 TABLE="smtp_gate"
-CHAIN="fwd"
+CHAIN="egress"
 SET_WL="wl_macs"
 SET_PORTS="blocked_ports"
 SET_VMPORTS="vm_ports"
@@ -118,8 +118,8 @@ generate_ruleset() {
     # log+drop were combined in one limited rule, excess packets would
     # fall through to the chain policy (accept).
     if [[ "${LOG_DROPS}" == "1" ]]; then
-      echo "    iifname @$SET_VMPORTS oifname @$SET_UPLINKS ether type ip  tcp dport @$SET_PORTS limit rate ${LOG_RATE} burst ${LOG_BURST} log prefix \"SMTPGATE4 \" flags all"
-      echo "    iifname @$SET_VMPORTS oifname @$SET_UPLINKS ether type ip6 tcp dport @$SET_PORTS limit rate ${LOG_RATE} burst ${LOG_BURST} log prefix \"SMTPGATE6 \" flags all"
+      echo "    iifname @$SET_VMPORTS oifname @$SET_UPLINKS ether type ip  tcp dport @$SET_PORTS limit rate ${LOG_RATE} burst ${LOG_BURST} packets log prefix \"SMTPGATE4 \" flags all"
+      echo "    iifname @$SET_VMPORTS oifname @$SET_UPLINKS ether type ip6 tcp dport @$SET_PORTS limit rate ${LOG_RATE} burst ${LOG_BURST} packets log prefix \"SMTPGATE6 \" flags all"
     fi
     echo "    iifname @$SET_VMPORTS oifname @$SET_UPLINKS ether type ip  tcp dport @$SET_PORTS counter drop"
     echo "    iifname @$SET_VMPORTS oifname @$SET_UPLINKS ether type ip6 tcp dport @$SET_PORTS counter drop"
@@ -171,14 +171,13 @@ cmd_apply() {
   ensure_dirs
   preflight
 
-  local tmp
-  tmp="$(mktemp /tmp/smtp-gate.XXXXXX.nft)"
-  trap 'rm -f "$tmp"' EXIT
+  _TMP="$(mktemp /tmp/smtp-gate.XXXXXX.nft)"
+  trap 'rm -f "${_TMP:-}"' EXIT
 
-  generate_ruleset "$tmp"
+  generate_ruleset "$_TMP"
 
-  nft -c -f "$tmp"   # validate (dry-run); on failure nothing changes
-  nft -f "$tmp"       # atomic load
+  nft -c -f "$_TMP"   # validate (dry-run); on failure nothing changes
+  nft -f "$_TMP"       # atomic load
 
   echo "ok: applied bridge=$BRIDGE ports=$BLOCKED_PORTS"
 }
