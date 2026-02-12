@@ -68,8 +68,9 @@ load_driver() {
   local drv="$SCRIPT_DIR/drivers/${name}.sh"
   [[ -f "$drv" ]] || { echo "error: driver '$name' not found ($drv)" >&2; return 1; }
   source "$drv"
-  hv_list_vms() { driver_list_vms "$@"; }
-  hv_vm_macs()  { driver_vm_macs "$@"; }
+  hv_list_vms()     { driver_list_vms "$@"; }
+  hv_vm_macs()      { driver_vm_macs "$@"; }
+  hv_all_vm_macs()  { if declare -f driver_all_vm_macs >/dev/null 2>&1; then driver_all_vm_macs "$@"; else return 1; fi; }
   HV_LOADED="$name"
 }
 
@@ -403,13 +404,15 @@ cmd_whitelist() {
   done < "$WL_FILE"
 
   # Collect VM entries: index status vmname mac
+  # Use bulk driver call (parallel) when available, fall back to per-VM
   local -a entries=()
   local idx=0 vm mac status
-  while read -r vm; do
-    [[ -n "$vm" ]] || continue
-    while read -r mac; do
-      [[ -n "$mac" ]] || continue
-      mac="$(echo "$mac" | tr 'A-F' 'a-f')"
+  local bulk
+  bulk="$(hv_all_vm_macs 2>/dev/null)" || true
+
+  if [[ -n "$bulk" ]]; then
+    while IFS=',' read -r vm mac; do
+      [[ -n "$vm" && -n "$mac" ]] || continue
       if [[ -n "${wl_macs[$mac]+x}" ]]; then
         status="whitelisted"
       else
@@ -417,8 +420,23 @@ cmd_whitelist() {
       fi
       idx=$((idx + 1))
       entries+=("$idx $status $vm $mac")
-    done < <(hv_vm_macs "$vm" 2>/dev/null || true)
-  done < <(hv_list_vms 2>/dev/null)
+    done <<< "$bulk"
+  else
+    while read -r vm; do
+      [[ -n "$vm" ]] || continue
+      while read -r mac; do
+        [[ -n "$mac" ]] || continue
+        mac="$(echo "$mac" | tr 'A-F' 'a-f')"
+        if [[ -n "${wl_macs[$mac]+x}" ]]; then
+          status="whitelisted"
+        else
+          status="blocked"
+        fi
+        idx=$((idx + 1))
+        entries+=("$idx $status $vm $mac")
+      done < <(hv_vm_macs "$vm" 2>/dev/null || true)
+    done < <(hv_list_vms 2>/dev/null)
+  fi
 
   if [[ ${#entries[@]} -eq 0 ]]; then
     echo "No VMs found."
