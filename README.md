@@ -60,9 +60,8 @@ journalctl -k --grep SMTPGATE
 ## Install
 
 ```bash
-git clone https://github.com/Scott-Mc/smtp-gate.git /usr/local/smtp-gate
-cd /usr/local/smtp-gate
-./install.sh
+curl -sL https://github.com/Scott-Mc/smtp-gate/releases/latest/download/smtp-gate.tar.gz \
+  | tar xz -C /usr/local && cd /usr/local/smtp-gate && ./install.sh
 ```
 
 Edit `config/smtp-gate.conf` if your bridge is not `br0`, then:
@@ -71,14 +70,12 @@ Edit `config/smtp-gate.conf` if your bridge is not `br0`, then:
 smtp-gate apply
 ```
 
-To update later:
+### Update
 
 ```bash
-cd /usr/local/smtp-gate && git pull
+curl -sL https://github.com/Scott-Mc/smtp-gate/releases/latest/download/smtp-gate.tar.gz \
+  | tar xz -C /usr/local
 ```
-
-The systemd service and `/usr/bin/smtp-gate` symlink both point into
-`/usr/local/smtp-gate/`, so a `git pull` updates the running script immediately.
 
 ### What gets installed
 
