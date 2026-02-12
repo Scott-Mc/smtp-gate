@@ -274,9 +274,9 @@ cmd_debug() {
   nft list table bridge "$TABLE" 2>/dev/null || echo "  (not loaded)"
 }
 
-cmd_rollback() {
+cmd_disable() {
   nft delete table bridge "$TABLE" >/dev/null 2>&1 || true
-  echo "ok: removed table bridge $TABLE"
+  echo "ok: disabled -- removed table bridge $TABLE"
 }
 
 cmd_ports_set() {
