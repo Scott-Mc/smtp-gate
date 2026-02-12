@@ -13,7 +13,7 @@ infrastructure.
 
 ```
 smtp-gate apply                                # block SMTP ports on all VMs
-smtp-gate rollback                             # remove all rules (unblock everything)
+smtp-gate disable                              # remove all rules (unblock everything)
 smtp-gate status                               # show current state + whitelisted VMs
 smtp-gate whitelist                            # interactive VM picker (shown below)
 smtp-gate add-vm  <name> [reason]              # whitelist a VM by name
@@ -101,7 +101,7 @@ The systemd service and `/usr/bin/smtp-gate` symlink both point into
   - **LXC**: `lxc-ls` / `lxc` — stub, not yet implemented
   - **Xen**: `xl` — stub, not yet implemented
 
-Core commands (`apply`, `status`, `rollback`, `add-mac`, `del-mac`, `list`,
+Core commands (`apply`, `status`, `disable`, `add-mac`, `del-mac`, `list`,
 `ports-set`) work without a hypervisor driver.
 
 ## Configuration
