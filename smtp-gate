@@ -491,7 +491,7 @@ Usage: smtp-gate <command> [args]
 Commands:
   status                             Show active/inactive state and whitelisted VMs
   apply                              (Re)apply nftables rules
-  rollback                           Remove all rules (unblock everything)
+  disable                            Remove all rules (unblock everything)
   whitelist                          Interactive VM picker
   add-vm  <vmname> [reason]          Whitelist a VM by name
   del-vm  <vmname>                   Remove a VM from the whitelist
@@ -515,7 +515,7 @@ cmd="${1:-}"; shift || true
 case "$cmd" in
   status)    cmd_status ;;
   apply)     cmd_apply ;;
-  rollback)  cmd_rollback ;;
+  disable)   cmd_disable ;;
   whitelist) cmd_whitelist ;;
   add-vm)    cmd_add_vm "${1:-}" "${2:-manual}" ;;
   del-vm)    cmd_del_vm "${1:-}" ;;
