@@ -2,8 +2,9 @@
 # smtp-gate -- block outbound SMTP from VM guests at the hypervisor
 set -euo pipefail
 
-CONF_DIR="/etc/smtp-gate"
-CONF_FILE="$CONF_DIR/config"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+CONF_DIR="$SCRIPT_DIR/config"
+CONF_FILE="$CONF_DIR/smtp-gate.conf"
 WL_FILE="$CONF_DIR/whitelist.csv"
 
 TABLE="smtp_gate"
@@ -56,10 +57,43 @@ vm_ports() {
 
 parse_ports() { echo "$BLOCKED_PORTS" | tr ',' ' ' | xargs -n1; }
 
-vm_macs() {
-  local vm="$1"
-  virsh domiflist "$vm" 2>/dev/null \
-    | awk 'BEGIN{IGNORECASE=1} $0 ~ /bridge/ && $5 ~ /([0-9a-f]{2}:){5}[0-9a-f]{2}/ {print tolower($5)}'
+# ---------------------------------------------------------------------------
+# Hypervisor driver loading
+# ---------------------------------------------------------------------------
+
+HV_LOADED=""
+
+load_driver() {
+  local name="$1"
+  local drv="$SCRIPT_DIR/drivers/${name}.sh"
+  [[ -f "$drv" ]] || { echo "error: driver '$name' not found ($drv)" >&2; return 1; }
+  source "$drv"
+  hv_list_vms() { driver_list_vms "$@"; }
+  hv_vm_macs()  { driver_vm_macs "$@"; }
+  HV_LOADED="$name"
+}
+
+detect_driver() {
+  [[ -n "$HV_LOADED" ]] && return 0
+  # Config override
+  if [[ -n "${HYPERVISOR:-}" ]]; then
+    load_driver "$HYPERVISOR"
+    return $?
+  fi
+  # Auto-detect: try each driver
+  local drv name
+  for drv in "$SCRIPT_DIR"/drivers/*.sh; do
+    [[ -f "$drv" ]] || continue
+    name="$(basename "$drv" .sh)"
+    (source "$drv"; driver_detect) && { load_driver "$name"; return 0; }
+  done
+  return 1
+}
+
+require_driver() {
+  [[ -n "$HV_LOADED" ]] && return 0
+  echo "error: no hypervisor driver detected (install virsh/lxc/xl or set HYPERVISOR in config)" >&2
+  exit 1
 }
 
 # ---------------------------------------------------------------------------
@@ -185,20 +219,56 @@ cmd_apply() {
 cmd_status() {
   load_conf
   ensure_dirs
+
+  # Active or inactive?
+  if nft list table bridge "$TABLE" >/dev/null 2>&1; then
+    echo "Status:     active"
+  else
+    echo "Status:     inactive (run 'smtp-gate apply')"
+  fi
+
+  echo "Bridge:     $BRIDGE"
+  echo "Ports:      $BLOCKED_PORTS"
+  echo "Hypervisor: ${HV_LOADED:-none}"
+  echo
+
+  # Whitelisted VMs from CSV
+  local count=0
+  echo "Whitelisted:"
+  while IFS=',' read -r name mac added_at added_by reason; do
+    [[ "$name" =~ ^# ]] && continue
+    [[ -n "$name" ]] || continue
+    mac="$(echo "$mac" | tr -d ' \t')"
+    [[ "$mac" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]] || continue
+    printf "  %-24s %s\n" "$name" "$mac"
+    count=$((count + 1))
+  done < "$WL_FILE"
+  [[ "$count" -gt 0 ]] || echo "  (none)"
+}
+
+cmd_debug() {
+  load_conf
+  ensure_dirs
+
   echo "Config:"
+  echo "  CONF_FILE=$CONF_FILE"
+  echo "  WL_FILE=$WL_FILE"
   echo "  BRIDGE=$BRIDGE"
   echo "  BLOCKED_PORTS=$BLOCKED_PORTS"
   echo "  LOG_DROPS=$LOG_DROPS"
+  echo "  LOG_RATE=$LOG_RATE"
+  echo "  LOG_BURST=$LOG_BURST"
   echo "  UPLINK_REGEX=${UPLINK_REGEX:-<default>}"
+  echo "  HYPERVISOR=${HV_LOADED:-<none detected>}"
   echo
   echo "Bridge ports ($BRIDGE):"
-  bridge_ports | sed 's/^/  - /'
+  bridge_ports | sed 's/^/  - /' || echo "  (none)"
   echo
   echo "Uplinks:"
-  uplink_ports | sed 's/^/  - /'
+  uplink_ports | sed 's/^/  - /' || echo "  (none)"
   echo
   echo "VM ports:"
-  vm_ports | sed 's/^/  - /'
+  vm_ports | sed 's/^/  - /' || echo "  (none)"
   echo
   echo "nft table:"
   nft list table bridge "$TABLE" 2>/dev/null || echo "  (not loaded)"
@@ -224,14 +294,14 @@ cmd_ports_set() {
 cmd_add_vm() {
   load_conf
   ensure_dirs
-  have_cmd virsh || { echo "error: virsh not found" >&2; exit 1; }
+  require_driver
 
   local vm="${1:-}"
   local reason="${2:-manual}"
   [[ -n "$vm" ]] || { echo "error: vm name required" >&2; exit 1; }
 
   local macs now user
-  macs="$(vm_macs "$vm" || true)"
+  macs="$(hv_vm_macs "$vm" || true)"
   [[ -n "$macs" ]] || { echo "error: no bridged MACs found for vm '$vm'" >&2; exit 1; }
 
   now="$(date -Is)"
@@ -318,24 +388,118 @@ cmd_list() {
   fi
 }
 
+cmd_whitelist() {
+  load_conf
+  ensure_dirs
+  require_driver
+
+  # Build set of whitelisted MACs from CSV
+  local -A wl_macs
+  while IFS=',' read -r name mac rest; do
+    [[ "$name" =~ ^# ]] && continue
+    mac="$(echo "$mac" | tr -d ' \t' | tr 'A-F' 'a-f')"
+    [[ "$mac" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] || continue
+    wl_macs["$mac"]=1
+  done < "$WL_FILE"
+
+  # Collect VM entries: index status vmname mac
+  local -a entries=()
+  local idx=0 vm mac status
+  while read -r vm; do
+    [[ -n "$vm" ]] || continue
+    while read -r mac; do
+      [[ -n "$mac" ]] || continue
+      mac="$(echo "$mac" | tr 'A-F' 'a-f')"
+      if [[ -n "${wl_macs[$mac]+x}" ]]; then
+        status="whitelisted"
+      else
+        status="blocked"
+      fi
+      idx=$((idx + 1))
+      entries+=("$idx $status $vm $mac")
+    done < <(hv_vm_macs "$vm" 2>/dev/null || true)
+  done < <(hv_list_vms 2>/dev/null)
+
+  if [[ ${#entries[@]} -eq 0 ]]; then
+    echo "No VMs found."
+    return 0
+  fi
+
+  # Print numbered list
+  printf "\n"
+  printf "  %-4s %-15s %-24s %s\n" "#" "STATUS" "VM" "MAC"
+  printf "  %-4s %-15s %-24s %s\n" "---" "-------------" "----------------------" "-----------------"
+  local entry num st nm mc
+  for entry in "${entries[@]}"; do
+    read -r num st nm mc <<< "$entry"
+    if [[ "$st" == "whitelisted" ]]; then
+      printf "  %-4s [whitelisted]   %-24s %s\n" "$num" "$nm" "$mc"
+    else
+      printf "  %-4s [blocked]       %-24s %s\n" "$num" "$nm" "$mc"
+    fi
+  done
+  printf "\n"
+
+  # Prompt -- select numbers to toggle
+  local selection
+  read -rp "Toggle numbers (comma-separated), or 'q' to quit: " selection
+  [[ "$selection" != "q" && "$selection" != "Q" ]] || return 0
+
+  local now user changed=0
+  now="$(date -Is)"
+  user="${SUDO_USER:-root}"
+
+  local sel
+  for sel in $(echo "$selection" | tr ',' ' '); do
+    sel="$(echo "$sel" | tr -d ' ')"
+    [[ "$sel" =~ ^[0-9]+$ ]] || continue
+    for entry in "${entries[@]}"; do
+      read -r num st nm mc <<< "$entry"
+      [[ "$num" == "$sel" ]] || continue
+      if [[ "$st" == "blocked" ]]; then
+        # Add to whitelist
+        echo "${nm},${mc},${now},${user},whitelist-cmd" >> "$WL_FILE"
+        echo "ok: whitelisted $nm ($mc)"
+        changed=$((changed + 1))
+      else
+        # Remove from whitelist -- delete lines matching this MAC
+        local tmp
+        tmp="$(mktemp)"
+        awk -F',' -v mac="$mc" '
+          $1 ~ /^#/ {print; next}
+          {gsub(/^[ \t]+|[ \t]+$/, "", $2); if (tolower($2)!=mac) print}
+        ' "$WL_FILE" > "$tmp"
+        mv "$tmp" "$WL_FILE"
+        echo "ok: removed $nm ($mc)"
+        changed=$((changed + 1))
+      fi
+    done
+  done
+
+  if [[ "$changed" -gt 0 ]]; then
+    cmd_apply >/dev/null
+    echo "ok: applied"
+  else
+    echo "No changes made."
+  fi
+}
+
 usage() {
   cat <<EOF
 Usage: smtp-gate <command> [args]
 
 Commands:
-  apply                              Detect ports and (re)apply nftables rules
-  status                             Show config, detected ports, and active rules
-  rollback                           Remove nftables table (unblock all SMTP)
-  ports-set "25,465,587"             Update blocked ports in config
-  add-vm  <vmname> [reason]          Whitelist a VM by name (resolves MAC via virsh)
+  status                             Show active/inactive state and whitelisted VMs
+  apply                              (Re)apply nftables rules
+  rollback                           Remove all rules (unblock everything)
+  whitelist                          Interactive VM picker
+  add-vm  <vmname> [reason]          Whitelist a VM by name
   del-vm  <vmname>                   Remove a VM from the whitelist
   add-mac <aa:bb:cc:dd:ee:ff> [label] Whitelist a MAC address directly
   del-mac <aa:bb:cc:dd:ee:ff>        Remove a MAC from the whitelist
-  list                               Show whitelist entries
-
-Blocks outbound TCP to BLOCKED_PORTS from VM tap ports to uplink ports only.
-Inbound SMTP is never affected.  A systemd timer runs 'apply' periodically
-to pick up new/removed VMs automatically.
+  ports-set "25,465,587"             Change blocked ports
+  list                               Show raw whitelist CSV
+  debug                              Show bridge ports, nft table, and full config
 EOF
 }
 
@@ -344,17 +508,21 @@ EOF
 # ---------------------------------------------------------------------------
 
 require_root
+load_conf
+detect_driver || true
 cmd="${1:-}"; shift || true
 
 case "$cmd" in
-  apply)     cmd_apply ;;
   status)    cmd_status ;;
+  apply)     cmd_apply ;;
   rollback)  cmd_rollback ;;
-  ports-set) cmd_ports_set "${1:-}" ;;
+  whitelist) cmd_whitelist ;;
   add-vm)    cmd_add_vm "${1:-}" "${2:-manual}" ;;
   del-vm)    cmd_del_vm "${1:-}" ;;
   add-mac)   cmd_add_mac "${1:-}" "${2:-manual}" ;;
   del-mac)   cmd_del_mac "${1:-}" ;;
+  ports-set) cmd_ports_set "${1:-}" ;;
   list)      cmd_list ;;
+  debug)     cmd_debug ;;
   *)         usage; exit 1 ;;
 esac

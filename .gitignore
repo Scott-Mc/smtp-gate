@@ -1,3 +1,9 @@
 *.swp
 *.swo
 *~
+
+# Live config and data 
+config/smtp-gate.conf
+config/whitelist.csv
+
+demo/

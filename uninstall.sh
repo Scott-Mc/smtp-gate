@@ -14,5 +14,4 @@ rm -f /usr/bin/smtp-gate
 
 echo "ok: uninstalled"
 echo "  install dir preserved: /usr/local/smtp-gate"
-echo "  config preserved:      /etc/smtp-gate"
-echo "  to remove all: rm -rf /usr/local/smtp-gate /etc/smtp-gate"
+echo "  to remove all: rm -rf /usr/local/smtp-gate"

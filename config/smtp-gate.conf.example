@@ -1,4 +1,4 @@
-# /etc/smtp-gate/config -- sourced by smtp-gate
+# smtp-gate.conf -- sourced by smtp-gate
 
 # Linux bridge that VM tap interfaces are enslaved to.
 BRIDGE="br0"
@@ -14,3 +14,7 @@ LOG_BURST="50"
 # Override the regex used to identify uplink (physical) ports on the bridge.
 # Default matches ens*, eno*, enp*, eth*, bond*.
 # UPLINK_REGEX="^(ens|eno|enp|eth|bond)[0-9a-zA-Z_.:-]*$"
+
+# Hypervisor driver.  Auto-detected if not set.
+# Available drivers: kvm, lxc, xen
+# HYPERVISOR="kvm"

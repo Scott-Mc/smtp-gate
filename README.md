@@ -25,7 +25,10 @@ Works alongside VirtFusion, UFW, and existing iptables/nft rules.
 
 - Linux with nftables (AlmaLinux 8+/9+/10+, Debian 10+, Ubuntu 20.04+)
 - `nft`, `bridge` (iproute2), `ip`
-- `virsh` (libvirt) -- only needed for `add-vm`
+- A hypervisor CLI for VM commands (`add-vm`, `whitelist`):
+  - **KVM/QEMU**: `virsh` (libvirt) -- auto-detected
+  - **LXC**: `lxc-ls` or `lxc` -- stub, not yet implemented
+  - **Xen**: `xl` -- stub, not yet implemented
 - A Linux bridge (e.g. `br0`) with VM tap interfaces
 
 ## Install
@@ -36,7 +39,7 @@ cd /usr/local/smtp-gate
 sudo ./install.sh
 ```
 
-Edit `/etc/smtp-gate/config` if your bridge is not `br0`, then:
+Edit `config/smtp-gate.conf` if your bridge is not `br0`, then:
 
 ```bash
 sudo smtp-gate apply
@@ -55,25 +58,27 @@ The systemd service and `/usr/bin/smtp-gate` symlink both point into
 
 | Path | Purpose |
 |------|---------|
-| `/usr/local/smtp-gate/` | Application directory |
+| `/usr/local/smtp-gate/` | Application directory (self-contained) |
 | `/usr/bin/smtp-gate` | Symlink into PATH |
-| `/etc/smtp-gate/config` | Configuration |
-| `/etc/smtp-gate/whitelist.csv` | Whitelist database |
+| `/usr/local/smtp-gate/config/smtp-gate.conf` | Configuration |
+| `/usr/local/smtp-gate/config/whitelist.csv` | Whitelist database |
 | `/etc/systemd/system/smtp-gate.service` | One-shot apply service |
 | `/etc/systemd/system/smtp-gate.timer` | 60s refresh timer |
 
 ## Usage
 
 ```
-smtp-gate apply                                # (re)apply rules
-smtp-gate status                               # show config and state
-smtp-gate rollback                             # remove rules (unblock all)
-smtp-gate ports-set "25,465,587"               # change blocked ports
-smtp-gate add-vm  <name> [reason]              # whitelist VM (resolves MAC)
+smtp-gate status                               # active/inactive + whitelisted VMs
+smtp-gate apply                                # (re)apply nftables rules
+smtp-gate rollback                             # remove all rules (unblock everything)
+smtp-gate whitelist                            # interactive VM picker
+smtp-gate add-vm  <name> [reason]              # whitelist VM by name
 smtp-gate del-vm  <name>                       # remove VM from whitelist
 smtp-gate add-mac <aa:bb:cc:dd:ee:ff> [label]  # whitelist MAC directly
 smtp-gate del-mac <aa:bb:cc:dd:ee:ff>          # remove MAC from whitelist
-smtp-gate list                                 # show whitelist
+smtp-gate ports-set "25,465,587"               # change blocked ports
+smtp-gate list                                 # show raw whitelist CSV
+smtp-gate debug                                # bridge ports, nft table, full config
 ```
 
 ### Whitelist a VM
@@ -82,6 +87,29 @@ smtp-gate list                                 # show whitelist
 sudo smtp-gate add-vm myserver "ID verified"
 # ok: whitelisted myserver (52:54:00:12:34:56)
 # ok: applied
+```
+
+### Interactive whitelist
+
+```bash
+sudo smtp-gate whitelist
+```
+
+Lists all VMs with their MAC addresses and whitelist status.  Select
+numbers to toggle -- blocked VMs get whitelisted, whitelisted VMs get
+removed:
+
+```
+  #    STATUS          VM                       MAC
+  ---  -------------   ----------------------   -----------------
+  1    [blocked]       vm-web-01                52:54:00:aa:bb:cc
+  2    [whitelisted]   vm-mail-01               52:54:00:dd:ee:ff
+  3    [blocked]       vm-app-03                52:54:00:11:22:33
+
+Toggle numbers (comma-separated), or 'q' to quit: 1,3
+ok: whitelisted vm-web-01 (52:54:00:aa:bb:cc)
+ok: whitelisted vm-app-03 (52:54:00:11:22:33)
+ok: applied
 ```
 
 ### Monitor blocked attempts
@@ -96,7 +124,7 @@ journalctl -k --grep SMTPGATE
 
 ## Configuration
 
-`/etc/smtp-gate/config`:
+`/usr/local/smtp-gate/config/smtp-gate.conf`:
 
 ```bash
 BRIDGE="br0"            # bridge to protect
@@ -105,15 +133,50 @@ LOG_DROPS="1"           # log dropped packets (0 to disable)
 LOG_RATE="5/second"     # log rate limit
 LOG_BURST="50"          # log burst allowance
 # UPLINK_REGEX="..."    # override uplink interface detection
+# HYPERVISOR="kvm"      # override auto-detection (kvm, lxc, xen)
 ```
 
 ## Whitelist format
 
-`/etc/smtp-gate/whitelist.csv`:
+`/usr/local/smtp-gate/config/whitelist.csv`:
 
 ```
 # vmname,mac,added_at,added_by,reason
 myserver,52:54:00:12:34:56,2025-06-15T10:30:45+00:00,admin,ID_verified
+```
+
+## Hypervisor drivers
+
+smtp-gate uses a modular driver system for hypervisor-specific operations
+(listing VMs, resolving MAC addresses).  Drivers live in the `drivers/`
+directory.
+
+| Driver | CLI tool | Status |
+|--------|----------|--------|
+| `kvm`  | `virsh`  | Full support |
+| `lxc`  | `lxc-ls` / `lxc` | Stub (detection only) |
+| `xen`  | `xl`     | Stub (detection only) |
+
+On startup, smtp-gate auto-detects the hypervisor by checking which CLI
+tools are available.  To skip auto-detection, set `HYPERVISOR` in
+`config/smtp-gate.conf`:
+
+```bash
+HYPERVISOR="kvm"
+```
+
+Core commands (`apply`, `add-mac`, `del-mac`, `list`, `status`, `rollback`,
+`ports-set`) work without a driver.  Only `add-vm` and `whitelist` require
+a loaded driver.
+
+### Writing a new driver
+
+Create `drivers/<name>.sh` with three functions:
+
+```bash
+driver_detect()        # return 0 if this hypervisor is available
+driver_list_vms()      # print all VM names, one per line
+driver_vm_macs <vm>    # print MAC addresses for a VM, one per line
 ```
 
 ## Uninstall
