@@ -7,7 +7,7 @@ to prevent email abuse and protect IP reputation - the same kind of SMTP
 restriction used by AWS, DigitalOcean, and Hetzner, but for your own
 infrastructure.
 
-![smtp-gate usage](PLACEHOLDER_USAGE_GIF_URL)
+![smtp-gate usage](https://github.com/user-attachments/assets/f2841d2d-19f4-4abb-b139-fdabe3ba1216)
 
 ## Usage
 
@@ -37,7 +37,7 @@ smtp-gate add-vm myserver "ID verified"
 
 Pick VMs from a list — blocked VMs get whitelisted, whitelisted VMs get removed:
 
-![smtp-gate whitelist](PLACEHOLDER_WHITELIST_GIF_URL)
+![smtp-gate whitelist](https://github.com/user-attachments/assets/f2841d2d-19f4-4abb-b139-fdabe3ba1216)
 
 ### Monitor blocked attempts
 
