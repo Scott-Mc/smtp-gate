@@ -25,6 +25,7 @@ if [[ "$REPO_DIR" != "$INSTALL_DIR" ]]; then
   mkdir -p "$INSTALL_DIR"
   cp -a "$REPO_DIR"/. "$INSTALL_DIR"/
 fi
+chmod 0700 "$INSTALL_DIR"
 chmod 0755 "$INSTALL_DIR/smtp-gate"
 
 # Symlink into PATH
