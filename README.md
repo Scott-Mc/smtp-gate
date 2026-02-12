@@ -35,7 +35,7 @@ smtp-gate add-vm myserver "ID verified"
 
 ### Interactive whitelist
 
-Pick VMs from a list — blocked VMs get whitelisted, whitelisted VMs get removed:
+Pick VMs from a list
 
 ![smtp-gate whitelist](https://github.com/user-attachments/assets/f2841d2d-19f4-4abb-b139-fdabe3ba1216)
 
