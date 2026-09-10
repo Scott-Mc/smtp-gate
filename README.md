@@ -74,8 +74,12 @@ smtp-gate apply
 
 ```bash
 curl -sL https://github.com/Scott-Mc/smtp-gate/releases/latest/download/smtp-gate.tar.gz \
-  | tar xz -C /usr/local
+  | tar xz -C /usr/local && /usr/local/smtp-gate/install.sh
 ```
+
+`install.sh` is safe to re-run: it keeps your config and whitelist, reinstalls
+the systemd units with `install` (no `cp -i` alias prompts), and restarts the
+timer.
 
 ### What gets installed
 

@@ -41,10 +41,11 @@ install -m 0644 "$INSTALL_DIR/systemd/smtp-gate.service" "$SVC_DST"
 install -m 0644 "$INSTALL_DIR/systemd/smtp-gate.timer"   "$TMR_DST"
 
 systemctl daemon-reload
-systemctl enable --now smtp-gate.timer
+systemctl enable smtp-gate.timer
+systemctl restart smtp-gate.timer
 
 echo "ok: installed to $INSTALL_DIR"
 echo "  command: smtp-gate"
 echo "  config:  $CFG_DIR/smtp-gate.conf"
 echo "  timer:   systemctl status smtp-gate.timer"
-echo "  update:  cd $INSTALL_DIR && git pull"
+echo "  update:  re-run $INSTALL_DIR/install.sh after unpacking a new release"

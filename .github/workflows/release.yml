@@ -1,0 +1,22 @@
+# Builds smtp-gate.tar.gz and publishes a GitHub release.
+# Runs only when a v* tag is pushed:  git tag -a v1.2.3 -m v1.2.3 && git push origin v1.2.3
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build tarball
+        run: |
+          git archive --format=tar --prefix=smtp-gate/ "$GITHUB_REF_NAME" \
+            ':!.github' ':!demo' ':!.claude' | gzip > smtp-gate.tar.gz
+          tar tzf smtp-gate.tar.gz
+      - name: Create release
+        run: gh release create "$GITHUB_REF_NAME" smtp-gate.tar.gz --title "$GITHUB_REF_NAME" --notes-file .github/release-notes.md
+        env:
+          GH_TOKEN: ${{ github.token }}
